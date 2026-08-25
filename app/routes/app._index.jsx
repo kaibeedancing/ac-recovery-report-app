@@ -91,9 +91,9 @@ function parsePartialRcTag(partialRcTag) {
 }
 
 function parseFullFrcTag(fullFrcTag) {
-  // Expected format: "FRC<checkout_id>V<value>"
-  // Extract V as the revenue value.
-  const re = /^FRC(.+?)V([+-]?\d+(?:\.\d+)?)$/;
+  // Expected format: "FRC<checkout_id>R<value>"
+  // Extract R as the revenue value.
+  const re = /^FRC(.+?)R([+-]?\d+(?:\.\d+)?)$/;
   const m = String(fullFrcTag).match(re);
   if (!m) return null;
 
@@ -151,7 +151,7 @@ async function fetchSeriesByTag({
 
       const tags = normalizeShopifyTags(node.tags);
 
-      // Find the "FRC<checkout_id>V<value>" tag on the ORDER
+      // Find the "FRC<checkout_id>R<value>" tag on the ORDER
       const fullFrcTag = tags.find(
         (t) => typeof t === "string" && t.startsWith("FRC")
       );

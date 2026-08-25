@@ -2,12 +2,11 @@
 
 client_id = "241456f0a44680b0a6a3a6cd5c19fed1"
 name = "AC Recovery Report"
-application_url = "https://shopify-gross-report-app.onrender.com/"
+application_url = "https://ac-recovery-report-app.onrender.com/"
 embedded = true
 
 [build]
 automatically_update_urls_on_dev = true
-include_config_on_deploy = true
 
 [webhooks]
 api_version = "2026-07"
