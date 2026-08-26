@@ -90,16 +90,13 @@ export async function action({ request }) {
       },
     });
 
-    
     console.log("GraphQL mutation raw resp:", resp);
 
-    
-    const data = await parseGraphqlResult(resp);
-    console.log("GraphQL mutation parsed data:", data);
-
     const parsed = await parseGraphqlResult(resp);
+    console.log("GraphQL mutation parsed data:", parsed);
+
     const errors = parsed?.data?.customerUpdate?.userErrors || [];
-    if (errors.length) throw new Error(errors.map(e => e.message).join("; "));
+    if (errors.length) throw new Error(errors.map((e) => e.message).join("; "));
   };
 
   const updateOrderTags = async (orderGid, nextTags) => {
@@ -114,7 +111,6 @@ export async function action({ request }) {
       }
     `;
 
-    // Note: OrderInput is for orderUpdate, takes id + tags
     const resp = await admin.graphql(mutation, {
       variables: {
         input: {
@@ -124,16 +120,13 @@ export async function action({ request }) {
       },
     });
 
-    
     console.log("GraphQL mutation raw resp:", resp);
 
-    
-    const data = await parseGraphqlResult(resp);
-    console.log("GraphQL mutation parsed data:", data);
-
     const parsed = await parseGraphqlResult(resp);
+    console.log("GraphQL mutation parsed data:", parsed);
+
     const errors = parsed?.data?.orderUpdate?.userErrors || [];
-    if (errors.length) throw new Error(errors.map(e => e.message).join("; "));
+    if (errors.length) throw new Error(errors.map((e) => e.message).join("; "));
   };
 
   const CUSTOMER_QUERY = `
