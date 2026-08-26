@@ -84,22 +84,21 @@ export async function action({ request }) {
     const resp = await admin.graphql(mutation, {
       variables: {
         input: {
-          id: customerGid, // or orderGid
+          id: customerGid,
           tags: tagsString,
         },
       },
     });
 
-    // ADD THIS:
+    
     console.log("GraphQL mutation raw resp:", resp);
 
-    // then continue:
+    
     const data = await parseGraphqlResult(resp);
     console.log("GraphQL mutation parsed data:", data);
 
-
-    const data = await parseGraphqlResult(resp);
-    const errors = data?.data?.customerUpdate?.userErrors || [];
+    const parsed = await parseGraphqlResult(resp);
+    const errors = parsed?.data?.customerUpdate?.userErrors || [];
     if (errors.length) throw new Error(errors.map(e => e.message).join("; "));
   };
 
@@ -125,8 +124,15 @@ export async function action({ request }) {
       },
     });
 
+    
+    console.log("GraphQL mutation raw resp:", resp);
+
+    
     const data = await parseGraphqlResult(resp);
-    const errors = data?.data?.orderUpdate?.userErrors || [];
+    console.log("GraphQL mutation parsed data:", data);
+
+    const parsed = await parseGraphqlResult(resp);
+    const errors = parsed?.data?.orderUpdate?.userErrors || [];
     if (errors.length) throw new Error(errors.map(e => e.message).join("; "));
   };
 
