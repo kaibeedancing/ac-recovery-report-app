@@ -84,11 +84,19 @@ export async function action({ request }) {
     const resp = await admin.graphql(mutation, {
       variables: {
         input: {
-          id: customerGid,
+          id: customerGid, // or orderGid
           tags: tagsString,
         },
       },
     });
+
+    // ADD THIS:
+    console.log("GraphQL mutation raw resp:", resp);
+
+    // then continue:
+    const data = await parseGraphqlResult(resp);
+    console.log("GraphQL mutation parsed data:", data);
+
 
     const data = await parseGraphqlResult(resp);
     const errors = data?.data?.customerUpdate?.userErrors || [];
