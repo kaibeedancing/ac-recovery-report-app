@@ -1,4 +1,4 @@
-import { Form, useLoaderData } from "react-router";
+import { redirect, Form, useLoaderData } from "react-router";
 import { login } from "../../shopify.server";
 import styles from "./styles.module.css";
 
@@ -83,15 +83,6 @@ export default function App() {
               View the recovered revenue graph and export the underlying data.
             </li>
           </ol>
-        </div>
-        
-        <div className={styles.ctaRow}>
-          <a className={styles.ctaPrimary} href="/app/report">
-            View report
-          </a>
-          <a className={styles.ctaSecondary} href="/app/export">
-            Export CSV
-          </a>
         </div>
       </div>
     </div>
