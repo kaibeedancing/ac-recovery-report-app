@@ -113,7 +113,8 @@ async function fetchSeriesByTag({
   const exclusiveEnd = addDaysISO(endDate, 1);
   const searchQuery = `tag:${tag} created_at:>=${startDate} created_at:<${exclusiveEnd}`;
 
-  const seriesMap = new Map(); // bucketKey -> { bucket, revenue: number, orderCount: number }
+  // bucketKey -> { bucket, revenue: number, orderCount: number, orderNumbers: string[] }
+  const seriesMap = new Map();
 
   let hasNextPage = true;
   let cursor = null;
@@ -126,6 +127,7 @@ async function fetchSeriesByTag({
             cursor
             node {
               id
+              name
               createdAt
               tags
             }
@@ -151,18 +153,17 @@ async function fetchSeriesByTag({
 
       const tags = normalizeShopifyTags(node.tags);
 
-      // Find the "FRC<checkout_id>R<value>" tag on the ORDER
       const fullFrcTag = tags.find(
         (t) => typeof t === "string" && t.startsWith("FRC")
       );
 
-
-      //Find the "Full-AC-Revenue-Recovery" tag
       const fullRecoTag = tags.find(
-        (t) => typeof t === "string" && t.startsWith("Full-AC-Revenue-Recovery")
+        (t) =>
+          typeof t === "string" &&
+          t.startsWith("Full-AC-Revenue-Recovery")
       );
 
-      // If the order doesn't have the FRC or Full-AC-Revenue-Recovery tag, it doesn't contribute to revenue
+      // If the order doesn't have both tags, it doesn't contribute to revenue
       if (!fullFrcTag) continue;
       if (!fullRecoTag) continue;
 
@@ -186,12 +187,14 @@ async function fetchSeriesByTag({
           bucket: bucketKey,
           revenue: 0,
           orderCount: 0,
+          orderNumbers: [],
         });
       }
 
       const entry = seriesMap.get(bucketKey);
       entry.revenue += safeFrcValue;
       entry.orderCount += 1;
+      if (node.name) entry.orderNumbers.push(node.name);
     }
 
     hasNextPage = connection.pageInfo.hasNextPage;
@@ -213,7 +216,7 @@ async function fetchSeriesByTag({
 
 async function fetchPartialSeriesByTag({
   admin,
-  tag, // tag name without "tag:" prefix (the existing PARTIAL_TAG_NAME)
+  tag, // tag name without "tag:" prefix
   startDate,
   endDate,
   bucketType,
@@ -221,7 +224,8 @@ async function fetchPartialSeriesByTag({
   const exclusiveEnd = addDaysISO(endDate, 1);
   const searchQuery = `tag:${tag} created_at:>=${startDate} created_at:<${exclusiveEnd}`;
 
-  const seriesMap = new Map(); // bucketKey -> { bucket, revenue: number, orderCount: number }
+  // bucketKey -> { bucket, revenue: number, orderCount: number, orderNumbers: string[] }
+  const seriesMap = new Map();
 
   let hasNextPage = true;
   let cursor = null;
@@ -234,6 +238,7 @@ async function fetchPartialSeriesByTag({
             cursor
             node {
               id
+              name
               createdAt
               tags
               customer {
@@ -263,20 +268,16 @@ async function fetchPartialSeriesByTag({
 
       const orderTags = normalizeShopifyTags(node.tags);
 
-      // Find the "PRC<id>R<value>V<value>" tag on the ORDER
       const partialRcTag = orderTags.find(
         (t) => typeof t === "string" && t.startsWith("PRC")
       );
 
-      // If the order doesn't have the PRC tag, it doesn't count
       if (!partialRcTag) continue;
 
-      // Customer must have the *exact same tag string* as the order tag
       const customerTags = normalizeShopifyTags(node.customer?.tags);
       const customerHasSameTag = customerTags.includes(partialRcTag);
       if (!customerHasSameTag) continue;
 
-      // Extract R: value from the tag
       const parsed = parsePartialRcTag(partialRcTag);
       if (!parsed) continue;
 
@@ -300,12 +301,14 @@ async function fetchPartialSeriesByTag({
           bucket: bucketKey,
           revenue: 0,
           orderCount: 0,
+          orderNumbers: [],
         });
       }
 
       const entry = seriesMap.get(bucketKey);
       entry.revenue += safePartialRevenue;
       entry.orderCount += 1;
+      if (node.name) entry.orderNumbers.push(node.name);
     }
 
     hasNextPage = connection.pageInfo.hasNextPage;
@@ -332,7 +335,7 @@ export const action = async ({ request }) => {
 
   let startDate = formData.get("startDate");
   let endDate = formData.get("endDate");
-  const bucket = formData.get("bucket"); // "day" | "week"
+  const bucket = formData.get("bucket"); // "day" | "week" | "month" | "year"
   const exportMode = formData.get("exportMode"); // "csv" | null
   const view = formData.get("view"); // "recovered" | "partial" | "both"
 
@@ -358,7 +361,6 @@ export const action = async ({ request }) => {
       ? "year"
       : "day";
 
-  // Full/recovered now uses tag string format "FRC<id>V<value>"
   const recovered = await fetchSeriesByTag({
     admin,
     tag: FULL_TAG_NAME,
@@ -367,9 +369,6 @@ export const action = async ({ request }) => {
     bucketType,
   });
 
-  // Partial uses:
-  // - order tag: "PRC<id>R<value>V<value>"
-  // - customer tags must contain the exact same tag string
   const partial = await fetchPartialSeriesByTag({
     admin,
     tag: PARTIAL_TAG_NAME,
@@ -386,8 +385,14 @@ export const action = async ({ request }) => {
         bucket: p.bucket,
         recoveredRevenue: Number(p.revenue || 0),
         partialRevenue: 0,
+
         recoveredOrderCount: Number(p.orderCount || 0),
         partialOrderCount: 0,
+
+        recoveredOrderNumbers: Array.isArray(p.orderNumbers)
+          ? p.orderNumbers
+          : [],
+        partialOrderNumbers: [],
       });
     }
 
@@ -397,13 +402,22 @@ export const action = async ({ request }) => {
           bucket: p.bucket,
           recoveredRevenue: 0,
           partialRevenue: Number(p.revenue || 0),
+
           recoveredOrderCount: 0,
           partialOrderCount: Number(p.orderCount || 0),
+
+          recoveredOrderNumbers: [],
+          partialOrderNumbers: Array.isArray(p.orderNumbers)
+            ? p.orderNumbers
+            : [],
         });
       } else {
         const row = map.get(p.bucket);
         row.partialRevenue = Number(p.revenue || 0);
         row.partialOrderCount = Number(p.orderCount || 0);
+        row.partialOrderNumbers = Array.isArray(p.orderNumbers)
+          ? p.orderNumbers
+          : [];
       }
     }
 
@@ -421,6 +435,7 @@ export const action = async ({ request }) => {
       ...p,
       revenue: Number(p.revenue ?? 0),
       orderCount: Number(p.orderCount ?? 0),
+      orderNumbers: Array.isArray(p.orderNumbers) ? p.orderNumbers : [],
     }));
     summary = {
       startDate,
@@ -435,6 +450,7 @@ export const action = async ({ request }) => {
       ...p,
       revenue: Number(p.revenue ?? 0),
       orderCount: Number(p.orderCount ?? 0),
+      orderNumbers: Array.isArray(p.orderNumbers) ? p.orderNumbers : [],
     }));
     summary = {
       startDate,
@@ -460,13 +476,26 @@ export const action = async ({ request }) => {
 
   if (exportMode === "csv") {
     if (selectedView === "both") {
-      const csv = buildCSV(payloadSeries, [
+      const payloadForCsv = payloadSeries.map((p) => ({
+        ...p,
+        recoveredOrderNumbers: Array.isArray(p.recoveredOrderNumbers)
+          ? p.recoveredOrderNumbers.join(" ")
+          : "",
+        partialOrderNumbers: Array.isArray(p.partialOrderNumbers)
+          ? p.partialOrderNumbers.join(" ")
+          : "",
+      }));
+
+      const csv = buildCSV(payloadForCsv, [
         "bucket",
         "recoveredRevenue",
         "recoveredOrderCount",
+        "recoveredOrderNumbers",
         "partialRevenue",
         "partialOrderCount",
+        "partialOrderNumbers",
       ]);
+
       return {
         export: {
           format: "csv",
@@ -477,7 +506,20 @@ export const action = async ({ request }) => {
         summary,
       };
     } else {
-      const csv = buildCSV(payloadSeries, ["bucket", "revenue", "orderCount"]);
+      const payloadForCsv = payloadSeries.map((p) => ({
+        ...p,
+        orderNumbers: Array.isArray(p.orderNumbers)
+          ? p.orderNumbers.join(" ")
+          : "",
+      }));
+
+      const csv = buildCSV(payloadForCsv, [
+        "bucket",
+        "revenue",
+        "orderCount",
+        "orderNumbers",
+      ]);
+
       const filename = `rc-value-report_${selectedView}_${startDate}_to_${endDate}_${bucketType}.csv`;
       return {
         export: {
@@ -612,7 +654,11 @@ export default function Index() {
     const exp = fetcher.data?.export;
     if (!exp?.csv) return;
 
-    downloadTextFile(exp.filename, exp.mime || "text/csv;charset=utf-8;", exp.csv);
+    downloadTextFile(
+      exp.filename,
+      exp.mime || "text/csv;charset=utf-8;",
+      exp.csv
+    );
     shopify.toast.show("CSV exported");
   }, [fetcher.data?.export, shopify]);
 
@@ -692,9 +738,7 @@ export default function Index() {
             <s-button
               variant="tertiary"
               onClick={exportCSV}
-              disabled={
-                isLoading || !Array.isArray(series) || series.length === 0
-              }
+              disabled={isLoading || !Array.isArray(series) || series.length === 0}
             >
               Export CSV
             </s-button>
