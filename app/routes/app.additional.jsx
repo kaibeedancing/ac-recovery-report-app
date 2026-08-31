@@ -13,7 +13,14 @@ export const loader = async ({ request }) => {
 export async function action({ request }) {
   const form = await request.formData();
   const intent = form.get("intent");
-  if (intent !== "cleanup-recovery-tags") return null;
+
+  if (
+    intent !== "cleanup-recovery-tags" &&
+    intent !== "cleanup-ac-revenue-recovery-tags" &&
+    intent !== "cleanup-offer-eligible-tags"
+  ) {
+    return null;
+  }
 
   const submittedPassword = String(form.get("password") || "");
   if (submittedPassword !== HARDCODED_PASSWORD) {
@@ -26,48 +33,95 @@ export async function action({ request }) {
 
   const { admin } = await authenticate.admin(request);
 
-  console.log("admin.rest:", admin?.rest);
-  console.log("admin keys:", admin ? Object.keys(admin) : admin);
-
-  const TARGET_TAGS = new Set([
-    "Partial-Cart-Recovery-Test",
-    "Organic-Cart-Recovery-Test",
-    "Recovered-Self-Checkout-Test"
-  ]);
-
-  const SUBSTRING_MATCHES = [
-    "FRC",
-    "PRC",
-    "RC ID",
-    "RC Value",
-    "Partial RC",
-    "Full RC",
-    "80%",
-  ];
-
-  const extractNumericIdFromGid = (gid) => {
-    const s = String(gid || "");
-    const parts = s.split("/");
-    return parts[parts.length - 1];
+  const parseGraphqlResult = async (resp) => {
+    if (resp && typeof resp.json === "function") return await resp.json();
+    return resp;
   };
 
-  const shouldCleanTags = (tags) => {
-    if (!Array.isArray(tags)) return false;
-    return tags.some((t) => TARGET_TAGS.has(t));
+  const getCustomersConn = (payload) => payload?.data?.customers ?? payload?.customers ?? null;
+  const getOrdersConn = (payload) => payload?.data?.orders ?? payload?.orders ?? null;
+
+  // -------- tag cleanup policy per intent --------
+  const buildCleanupPolicy = (policyIntent) => {
+    if (policyIntent === "cleanup-recovery-tags") {
+      const TARGET_TAGS = new Set([
+        "Partial-Cart-Recovery-Test",
+        "Organic-Cart-Recovery-Test",
+        "Recovered-Self-Checkout-Test",
+      ]);
+
+      const SUBSTRING_MATCHES = [
+        "FRC",
+        "PRC",
+        "RC ID",
+        "RC Value",
+        "Partial RC",
+        "Full RC",
+        "80%",
+      ];
+
+      return {
+        scope: "customers_and_orders",
+        shouldCleanTags: (tags) => Array.isArray(tags) && tags.some((t) => TARGET_TAGS.has(t)),
+        cleanTags: (tags) => {
+          if (!Array.isArray(tags)) return tags;
+
+          let out = tags.filter((t) => !TARGET_TAGS.has(t));
+
+          out = out.filter((t) => {
+            const str = String(t || "");
+            return !SUBSTRING_MATCHES.some((needle) => str.includes(needle));
+          });
+
+          return [...new Set(out)];
+        },
+      };
+    }
+
+    if (policyIntent === "cleanup-ac-revenue-recovery-tags") {
+      const TARGET_TAGS = new Set(["Full-AC-Revenue-Recovery", "Partial-AC-Revenue-Recovery"]);
+      const PREFIXES_TO_REMOVE = ["FRC", "PRC"];
+
+      return {
+        scope: "customers_and_orders",
+        // exact match triggers cleanup on that record
+        shouldCleanTags: (tags) => Array.isArray(tags) && tags.some((t) => TARGET_TAGS.has(t)),
+        cleanTags: (tags) => {
+          if (!Array.isArray(tags)) return tags;
+
+          // remove exact target tags
+          let out = tags.filter((t) => !TARGET_TAGS.has(t));
+
+          // remove any other tags that start with "FRC" or "PRC"
+          out = out.filter((t) => {
+            const str = String(t || "");
+            return !PREFIXES_TO_REMOVE.some((prefix) => str.startsWith(prefix));
+          });
+
+          return [...new Set(out)];
+        },
+      };
+    }
+
+    // cleanup-offer-eligible-tags
+    // remove all tags from customers ONLY that CONTAIN "5%-Offer-Eligible" or "10%-Offer-Eligible"
+    return {
+      scope: "customers_only",
+      shouldCleanTags: (tags) => {
+        if (!Array.isArray(tags)) return false;
+        return tags.some((t) => {
+          const str = String(t || "");
+          return str.includes("5%-Offer-Eligible") || str.includes("10%-Offer-Eligible");
+        });
+      },
+      cleanTags: () => {
+        // remove ALL tags for matching customers
+        return [];
+      },
+    };
   };
 
-  const cleanTags = (tags) => {
-    if (!Array.isArray(tags)) return tags;
-
-    let out = tags.filter((t) => !TARGET_TAGS.has(t));
-
-    out = out.filter((t) => {
-      const str = String(t || "");
-      return !SUBSTRING_MATCHES.some((needle) => str.includes(needle));
-    });
-
-    return [...new Set(out)];
-  };
+  const policy = buildCleanupPolicy(intent);
 
   const updateCustomerTags = async (customerGid, nextTags) => {
     const tagsString = (nextTags || []).join(", ");
@@ -90,11 +144,7 @@ export async function action({ request }) {
       },
     });
 
-    console.log("GraphQL mutation raw resp:", resp);
-
     const parsed = await parseGraphqlResult(resp);
-    console.log("GraphQL mutation parsed data:", parsed);
-
     const errors = parsed?.data?.customerUpdate?.userErrors || [];
     if (errors.length) throw new Error(errors.map((e) => e.message).join("; "));
   };
@@ -120,11 +170,7 @@ export async function action({ request }) {
       },
     });
 
-    console.log("GraphQL mutation raw resp:", resp);
-
     const parsed = await parseGraphqlResult(resp);
-    console.log("GraphQL mutation parsed data:", parsed);
-
     const errors = parsed?.data?.orderUpdate?.userErrors || [];
     if (errors.length) throw new Error(errors.map((e) => e.message).join("; "));
   };
@@ -165,30 +211,18 @@ export async function action({ request }) {
     }
   `;
 
-  const getCustomersConn = (payload) =>
-    payload?.data?.customers ?? payload?.customers ?? null;
-
-  const getOrdersConn = (payload) =>
-    payload?.data?.orders ?? payload?.orders ?? null;
-
-  const parseGraphqlResult = async (resp) => {
-    if (resp && typeof resp.json === "function") return await resp.json();
-    return resp;
-  };
-
   let customersChecked = 0;
   let customersUpdated = 0;
   let customersEdgesSeen = 0;
   let customersSample = null;
 
-  // Customers: iterate through all pages
+  // Customers loop (always runs; policy decides whether to modify)
   {
     let cursor = null;
     while (true) {
-      const resp = await admin.graphql(
-        `#graphql\n${CUSTOMER_QUERY}`,
-        { variables: { first: 250, after: cursor } }
-      );
+      const resp = await admin.graphql(`#graphql\n${CUSTOMER_QUERY}`, {
+        variables: { first: 250, after: cursor },
+      });
 
       const data = await parseGraphqlResult(resp);
       const conn = getCustomersConn(data);
@@ -209,9 +243,9 @@ export async function action({ request }) {
         customersChecked++;
 
         const tags = node.tags || [];
-        if (!shouldCleanTags(tags)) continue;
+        if (!policy.shouldCleanTags(tags)) continue;
 
-        const nextTags = cleanTags(tags);
+        const nextTags = policy.cleanTags(tags);
 
         const originalStr = Array.isArray(tags) ? tags.join(",") : "";
         const nextStr = Array.isArray(nextTags) ? nextTags.join(",") : "";
@@ -233,14 +267,13 @@ export async function action({ request }) {
   let ordersEdgesSeen = 0;
   let ordersSample = null;
 
-  // Orders: iterate through all pages
-  {
+  // Orders loop only when policy scope includes orders
+  if (policy.scope === "customers_and_orders") {
     let cursor = null;
     while (true) {
-      const resp = await admin.graphql(
-        `#graphql\n${ORDERS_QUERY}`,
-        { variables: { first: 250, after: cursor } }
-      );
+      const resp = await admin.graphql(`#graphql\n${ORDERS_QUERY}`, {
+        variables: { first: 250, after: cursor },
+      });
 
       const data = await parseGraphqlResult(resp);
       const conn = getOrdersConn(data);
@@ -266,9 +299,9 @@ export async function action({ request }) {
         ordersChecked++;
 
         const tags = node.tags || [];
-        if (!shouldCleanTags(tags)) continue;
+        if (!policy.shouldCleanTags(tags)) continue;
 
-        const nextTags = cleanTags(tags);
+        const nextTags = policy.cleanTags(tags);
 
         const originalStr = Array.isArray(tags) ? tags.join(",") : "";
         const nextStr = Array.isArray(nextTags) ? nextTags.join(",") : "";
@@ -304,55 +337,99 @@ export async function action({ request }) {
 
 export default function AdditionalPage() {
   const fetcher = useFetcher();
+  const busy = fetcher.state !== "idle";
+
+  // Shared form ref fields
+  const [passwordValue, setPasswordValue] = React.useState("");
+
+  const submitIntent = (intentValue) => {
+    if (busy) return;
+
+    const formEl = document.getElementById("tag-cleanup-form");
+    const intentEl = document.getElementById("tag-cleanup-intent");
+
+    if (!formEl || !intentEl) return;
+
+    intentEl.value = intentValue;
+
+    // Submit the shared form
+    formEl.requestSubmit();
+  };
 
   return (
     <s-page heading="Test Tag Cleanup">
       <s-section heading="Run cleanup">
         <s-paragraph>
-          Click the button to remove recovery-test tags from all customers and
-          orders. It removes:
-          <br />
-          - Exact tags: <code>Partial-Cart-Recovery-Test</code>,{" "} <code>Recovered-Self-Checkout-Test</code> and{" "}
-          <code>Organic-Cart-Recovery-Test</code>
-          <br />
-          - Any other tags containing: <code>FRC</code>, <code>PRC</code>,{" "}
-          <code>RC ID</code>, <code>Partial RC</code>,{" "}
-          <code>Full RC</code>, <code>80%</code>
+          Click a button to run cleanup. All buttons share the same password.
         </s-paragraph>
 
-        <fetcher.Form method="post">
-          <input type="hidden" name="intent" value="cleanup-recovery-tags" />
+        <fetcher.Form method="post" id="tag-cleanup-form">
+          {/* Single password block */}
+          <input type="hidden" name="intent" id="tag-cleanup-intent" value="" />
+          <input type="hidden" name="password" value={passwordValue} />
 
           <input
-            name="password"
             type="password"
             placeholder="Password"
             autoComplete="current-password"
             style={{ width: 260 }}
+            value={passwordValue}
+            onChange={(e) => setPasswordValue(e.target.value)}
           />
 
-          <s-button type="submit" disabled={fetcher.state !== "idle"}>
-            {fetcher.state !== "idle" ? "Running..." : "Check & remove tags"}
-          </s-button>
-        </fetcher.Form>
+          <div style={{ marginTop: 12 }}>
+            <s-button type="button" onClick={() => submitIntent("cleanup-recovery-tags")} disabled={busy}>
+              {busy ? "Running..." : "Check & remove current test recovery tags"}
+            </s-button>
+          </div>
 
-        {fetcher.data?.summary ? (
-          <s-paragraph style={{ marginTop: 12, whiteSpace: "pre-wrap" }}>
-            {fetcher.data.summary}
-          </s-paragraph>
-        ) : null}
+          <div style={{ marginTop: 12 }}>
+            <s-button
+              type="button"
+              onClick={() => submitIntent("cleanup-ac-revenue-recovery-tags")}
+              disabled={busy}
+            >
+              {busy ? "Running..." : "Check & remove AC revenue recovery tags"}
+            </s-button>
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <s-button
+              type="button"
+              onClick={() => submitIntent("cleanup-offer-eligible-tags")}
+              disabled={busy}
+            >
+              {busy ? "Running..." : "Check & clear Offer-Eligible customer tags"}
+            </s-button>
+          </div>
+
+          {fetcher.data?.summary ? (
+            <s-paragraph style={{ marginTop: 12, whiteSpace: "pre-wrap" }}>
+              {fetcher.data.summary}
+            </s-paragraph>
+          ) : null}
+        </fetcher.Form>
       </s-section>
 
       <s-section slot="aside" heading="Targets">
         <s-unordered-list>
           <s-list-item>
-            Exact match removals: <code>Partial-Cart-Recovery-Test</code>,{" "} <code>Recovered-Self-Checkout-Test</code> and{" "}
-            <code>Organic-Cart-Recovery-Test</code>
+            Button 1: removes exact tags{" "}
+            <code>Partial-Cart-Recovery-Test</code>, <code>Organic-Cart-Recovery-Test</code>,{" "}
+            <code>Recovered-Self-Checkout-Test</code> and also removes any other tags containing{" "}
+            <code>FRC</code>, <code>PRC</code>, <code>RC ID</code>, <code>RC Value</code>,{" "}
+            <code>Partial RC</code>, <code>Full RC</code>, <code>80%</code>.
           </s-list-item>
+
           <s-list-item>
-            Substring removals: <code>FRC</code>, <code>PRC</code>,{" "}
-            <code>RC ID</code>, <code>Partial RC</code>,{" "}
-            <code>Full RC</code>, <code>80%</code>
+            Button 2: exact match{" "}
+            <code>Full-AC-Revenue-Recovery</code> / <code>Partial-AC-Revenue-Recovery</code>, remove those tags,
+            and also remove any other tags that start with <code>FRC</code> or <code>PRC</code>.
+          </s-list-item>
+
+          <s-list-item>
+            Button 3: customers only; if a customer has a tag containing{" "}
+            <code>5%-Offer-Eligible</code> or <code>10%-Offer-Eligible</code>, remove <em>all</em> their tags.
           </s-list-item>
         </s-unordered-list>
       </s-section>
