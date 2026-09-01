@@ -20,15 +20,47 @@ export const loader = async ({ request }) => {
   return null;
 };
 
-function getISOWeek(date) {
+function getISOWeekInfo(date) {
   const tmp = new Date(
     Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())
   );
+
   const dayNum = tmp.getUTCDay() || 7;
+
+  // Move to the Thursday of the current ISO week.
   tmp.setUTCDate(tmp.getUTCDate() + 4 - dayNum);
-  const yearStart = new Date(Date.UTC(tmp.getUTCFullYear(), 0, 1));
-  const weekNo = Math.ceil((((tmp - yearStart) / 86400000) + 1) / 7);
-  return weekNo;
+
+  const isoYear = tmp.getUTCFullYear();
+  const yearStart = new Date(Date.UTC(isoYear, 0, 1));
+
+  const week = Math.ceil((((tmp - yearStart) / 86400000) + 1) / 7);
+
+  return {
+    isoYear,
+    week,
+  };
+}
+
+function getBucketKey(date, bucketType) {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+
+  if (bucketType === "year") {
+    return String(year);
+  }
+
+  if (bucketType === "month") {
+    return `${year}-${month}`;
+  }
+
+  if (bucketType === "week") {
+    const { isoYear, week } = getISOWeekInfo(date);
+
+    return `${isoYear}-W${String(week).padStart(2, "0")}`;
+  }
+
+  return `${year}-${month}-${day}`;
 }
 
 function toISODateUTCString(d) {
@@ -48,9 +80,11 @@ function buildCSV(rows, headers) {
   };
 
   const headerLine = headers.map(escape).join(",");
+
   const lines = rows.map((row) =>
     headers.map((h) => escape(row?.[h])).join(",")
   );
+
   return [headerLine, ...lines].join("\n");
 }
 
@@ -58,29 +92,38 @@ function downloadTextFile(filename, mime, text) {
   const blob = new Blob([text], { type: mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
+
   a.href = url;
   a.download = filename;
   a.click();
+
   URL.revokeObjectURL(url);
 }
 
 function normalizeShopifyTags(tagsRaw) {
   if (!tagsRaw) return [];
-  if (Array.isArray(tagsRaw)) return tagsRaw;
+
+  if (Array.isArray(tagsRaw)) {
+    return tagsRaw;
+  }
+
   if (typeof tagsRaw === "string") {
     return tagsRaw
       .split(",")
       .map((t) => t.trim())
       .filter(Boolean);
   }
+
   return [];
 }
 
 function parsePartialRcTag(partialRcTag) {
-  // Expected format: "PRC<id>R<recovered value>V<total value>"
+  // Expected format:
+  // PRC<id>R<recovered value>V<total value>
   const re = /^PRC(.+?)R([+-]?\d+(?:\.\d+)?)V([+-]?\d+(?:\.\d+)?)$/;
 
   const m = String(partialRcTag).match(re);
+
   if (!m) return null;
 
   return {
@@ -91,10 +134,13 @@ function parsePartialRcTag(partialRcTag) {
 }
 
 function parseFullFrcTag(fullFrcTag) {
-  // Expected format: "FRC<checkout_id>R<value>"
+  // Expected format:
+  // FRC<checkout_id>R<value>
   // Extract R as the revenue value.
   const re = /^FRC(.+?)R([+-]?\d+(?:\.\d+)?)$/;
+
   const m = String(fullFrcTag).match(re);
+
   if (!m) return null;
 
   return {
@@ -105,7 +151,7 @@ function parseFullFrcTag(fullFrcTag) {
 
 async function fetchSeriesByTag({
   admin,
-  tag, // tag name without "tag:" prefix
+  tag,
   startDate,
   endDate,
   bucketType,
@@ -113,7 +159,12 @@ async function fetchSeriesByTag({
   const exclusiveEnd = addDaysISO(endDate, 1);
   const searchQuery = `tag:${tag} created_at:>=${startDate} created_at:<${exclusiveEnd}`;
 
-  // bucketKey -> { bucket, revenue: number, orderCount: number, orderNumbers: string[] }
+  // bucketKey -> {
+  //   bucket: string,
+  //   revenue: number,
+  //   orderCount: number,
+  //   orderNumbers: string[]
+  // }
   const seriesMap = new Map();
 
   let hasNextPage = true;
@@ -141,20 +192,28 @@ async function fetchSeriesByTag({
     `;
 
     const response = await admin.graphql(`#graphql\n${query}`, {
-      variables: { first: 50, after: cursor, q: searchQuery },
+      variables: {
+        first: 50,
+        after: cursor,
+        q: searchQuery,
+      },
     });
 
     const data = await response.json();
     const connection = data?.data?.orders;
-    if (!connection) break;
+
+    if (!connection) {
+      break;
+    }
 
     for (const edge of connection.edges) {
       const node = edge.node;
-
       const tags = normalizeShopifyTags(node.tags);
 
       const fullFrcTag = tags.find(
-        (t) => typeof t === "string" && t.startsWith("FRC")
+        (t) =>
+          typeof t === "string" &&
+          t.startsWith("FRC")
       );
 
       const fullRecoTag = tags.find(
@@ -163,24 +222,19 @@ async function fetchSeriesByTag({
           t.startsWith("Full-AC-Revenue-Recovery")
       );
 
-      // If the order doesn't have both tags, it doesn't contribute to revenue
+      // The order must have both tags to contribute to recovered revenue.
       if (!fullFrcTag) continue;
       if (!fullRecoTag) continue;
 
       const parsed = parseFullFrcTag(fullFrcTag);
+
       const safeFrcValue =
-        parsed && Number.isFinite(parsed.value) ? parsed.value : 0;
+        parsed && Number.isFinite(parsed.value)
+          ? parsed.value
+          : 0;
 
       const createdAt = new Date(node.createdAt);
-
-      let bucketKey;
-      if (bucketType === "week") {
-        const year = createdAt.getUTCFullYear();
-        const week = getISOWeek(createdAt);
-        bucketKey = `${year}-W${String(week).padStart(2, "0")}`;
-      } else {
-        bucketKey = createdAt.toISOString().slice(0, 10);
-      }
+      const bucketKey = getBucketKey(createdAt, bucketType);
 
       if (!seriesMap.has(bucketKey)) {
         seriesMap.set(bucketKey, {
@@ -192,9 +246,13 @@ async function fetchSeriesByTag({
       }
 
       const entry = seriesMap.get(bucketKey);
+
       entry.revenue += safeFrcValue;
       entry.orderCount += 1;
-      if (node.name) entry.orderNumbers.push(node.name);
+
+      if (node.name) {
+        entry.orderNumbers.push(node.name);
+      }
     }
 
     hasNextPage = connection.pageInfo.hasNextPage;
@@ -205,18 +263,26 @@ async function fetchSeriesByTag({
     a.bucket.localeCompare(b.bucket)
   );
 
-  const totalRevenue = series.reduce((sum, p) => sum + (p.revenue || 0), 0);
-  const ordersReturned = series.reduce(
-    (n, p) => n + (p.orderCount || 0),
+  const totalRevenue = series.reduce(
+    (sum, point) => sum + (point.revenue || 0),
     0
   );
 
-  return { series, totalRevenue, ordersReturned };
+  const ordersReturned = series.reduce(
+    (count, point) => count + (point.orderCount || 0),
+    0
+  );
+
+  return {
+    series,
+    totalRevenue,
+    ordersReturned,
+  };
 }
 
 async function fetchPartialSeriesByTag({
   admin,
-  tag, // tag name without "tag:" prefix
+  tag,
   startDate,
   endDate,
   bucketType,
@@ -224,7 +290,12 @@ async function fetchPartialSeriesByTag({
   const exclusiveEnd = addDaysISO(endDate, 1);
   const searchQuery = `tag:${tag} created_at:>=${startDate} created_at:<${exclusiveEnd}`;
 
-  // bucketKey -> { bucket, revenue: number, orderCount: number, orderNumbers: string[] }
+  // bucketKey -> {
+  //   bucket: string,
+  //   revenue: number,
+  //   orderCount: number,
+  //   orderNumbers: string[]
+  // }
   const seriesMap = new Map();
 
   let hasNextPage = true;
@@ -256,45 +327,53 @@ async function fetchPartialSeriesByTag({
     `;
 
     const response = await admin.graphql(`#graphql\n${query}`, {
-      variables: { first: 50, after: cursor, q: searchQuery },
+      variables: {
+        first: 50,
+        after: cursor,
+        q: searchQuery,
+      },
     });
 
     const data = await response.json();
     const connection = data?.data?.orders;
-    if (!connection) break;
+
+    if (!connection) {
+      break;
+    }
 
     for (const edge of connection.edges) {
       const node = edge.node;
-
       const orderTags = normalizeShopifyTags(node.tags);
 
       const partialRcTag = orderTags.find(
-        (t) => typeof t === "string" && t.startsWith("PRC")
+        (t) =>
+          typeof t === "string" &&
+          t.startsWith("PRC")
       );
 
-      if (!partialRcTag) continue;
+      if (!partialRcTag) {
+        continue;
+      }
 
       const customerTags = normalizeShopifyTags(node.customer?.tags);
       const customerHasSameTag = customerTags.includes(partialRcTag);
-      if (!customerHasSameTag) continue;
+
+      if (!customerHasSameTag) {
+        continue;
+      }
 
       const parsed = parsePartialRcTag(partialRcTag);
-      if (!parsed) continue;
+
+      if (!parsed) {
+        continue;
+      }
 
       const safePartialRevenue = Number.isFinite(parsed.rValue)
         ? parsed.rValue
         : 0;
 
       const createdAt = new Date(node.createdAt);
-
-      let bucketKey;
-      if (bucketType === "week") {
-        const year = createdAt.getUTCFullYear();
-        const week = getISOWeek(createdAt);
-        bucketKey = `${year}-W${String(week).padStart(2, "0")}`;
-      } else {
-        bucketKey = createdAt.toISOString().slice(0, 10);
-      }
+      const bucketKey = getBucketKey(createdAt, bucketType);
 
       if (!seriesMap.has(bucketKey)) {
         seriesMap.set(bucketKey, {
@@ -306,9 +385,13 @@ async function fetchPartialSeriesByTag({
       }
 
       const entry = seriesMap.get(bucketKey);
+
       entry.revenue += safePartialRevenue;
       entry.orderCount += 1;
-      if (node.name) entry.orderNumbers.push(node.name);
+
+      if (node.name) {
+        entry.orderNumbers.push(node.name);
+      }
     }
 
     hasNextPage = connection.pageInfo.hasNextPage;
@@ -319,25 +402,33 @@ async function fetchPartialSeriesByTag({
     a.bucket.localeCompare(b.bucket)
   );
 
-  const totalRevenue = series.reduce((sum, p) => sum + (p.revenue || 0), 0);
-  const ordersReturned = series.reduce(
-    (n, p) => n + (p.orderCount || 0),
+  const totalRevenue = series.reduce(
+    (sum, point) => sum + (point.revenue || 0),
     0
   );
 
-  return { series, totalRevenue, ordersReturned };
+  const ordersReturned = series.reduce(
+    (count, point) => count + (point.orderCount || 0),
+    0
+  );
+
+  return {
+    series,
+    totalRevenue,
+    ordersReturned,
+  };
 }
 
 export const action = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
-
   const formData = await request.formData();
 
   let startDate = formData.get("startDate");
   let endDate = formData.get("endDate");
-  const bucket = formData.get("bucket"); // "day" | "week" | "month" | "year"
-  const exportMode = formData.get("exportMode"); // "csv" | null
-  const view = formData.get("view"); // "recovered" | "partial" | "both"
+
+  const bucket = formData.get("bucket");
+  const exportMode = formData.get("exportMode");
+  const view = formData.get("view");
 
   const FULL_TAG_NAME = "Full-AC-Revenue-Recovery";
   const PARTIAL_TAG_NAME = "Partial-AC-Revenue-Recovery";
@@ -347,6 +438,7 @@ export const action = async ({ request }) => {
     d.setUTCDate(d.getUTCDate() - 90);
     startDate = toISODateUTCString(d);
   }
+
   if (!endDate) {
     const d = new Date();
     endDate = toISODateUTCString(d);
@@ -380,63 +472,75 @@ export const action = async ({ request }) => {
   const seriesBoth = (() => {
     const map = new Map();
 
-    for (const p of recovered.series) {
-      map.set(p.bucket, {
-        bucket: p.bucket,
-        recoveredRevenue: Number(p.revenue || 0),
+    for (const point of recovered.series) {
+      map.set(point.bucket, {
+        bucket: point.bucket,
+
+        recoveredRevenue: Number(point.revenue || 0),
         partialRevenue: 0,
 
-        recoveredOrderCount: Number(p.orderCount || 0),
+        recoveredOrderCount: Number(point.orderCount || 0),
         partialOrderCount: 0,
 
-        recoveredOrderNumbers: Array.isArray(p.orderNumbers)
-          ? p.orderNumbers
+        recoveredOrderNumbers: Array.isArray(point.orderNumbers)
+          ? point.orderNumbers
           : [],
+
         partialOrderNumbers: [],
       });
     }
 
-    for (const p of partial.series) {
-      if (!map.has(p.bucket)) {
-        map.set(p.bucket, {
-          bucket: p.bucket,
+    for (const point of partial.series) {
+      if (!map.has(point.bucket)) {
+        map.set(point.bucket, {
+          bucket: point.bucket,
+
           recoveredRevenue: 0,
-          partialRevenue: Number(p.revenue || 0),
+          partialRevenue: Number(point.revenue || 0),
 
           recoveredOrderCount: 0,
-          partialOrderCount: Number(p.orderCount || 0),
+          partialOrderCount: Number(point.orderCount || 0),
 
           recoveredOrderNumbers: [],
-          partialOrderNumbers: Array.isArray(p.orderNumbers)
-            ? p.orderNumbers
+          partialOrderNumbers: Array.isArray(point.orderNumbers)
+            ? point.orderNumbers
             : [],
         });
       } else {
-        const row = map.get(p.bucket);
-        row.partialRevenue = Number(p.revenue || 0);
-        row.partialOrderCount = Number(p.orderCount || 0);
-        row.partialOrderNumbers = Array.isArray(p.orderNumbers)
-          ? p.orderNumbers
+        const row = map.get(point.bucket);
+
+        row.partialRevenue = Number(point.revenue || 0);
+        row.partialOrderCount = Number(point.orderCount || 0);
+
+        row.partialOrderNumbers = Array.isArray(point.orderNumbers)
+          ? point.orderNumbers
           : [];
       }
     }
 
-    return [...map.values()].sort((a, b) => a.bucket.localeCompare(b.bucket));
+    return [...map.values()].sort((a, b) =>
+      a.bucket.localeCompare(b.bucket)
+    );
   })();
 
   const selectedView =
-    view === "partial" || view === "both" ? view : "recovered";
+    view === "partial" || view === "both"
+      ? view
+      : "recovered";
 
   let payloadSeries = [];
   let summary = null;
 
   if (selectedView === "recovered") {
-    payloadSeries = recovered.series.map((p) => ({
-      ...p,
-      revenue: Number(p.revenue ?? 0),
-      orderCount: Number(p.orderCount ?? 0),
-      orderNumbers: Array.isArray(p.orderNumbers) ? p.orderNumbers : [],
+    payloadSeries = recovered.series.map((point) => ({
+      ...point,
+      revenue: Number(point.revenue ?? 0),
+      orderCount: Number(point.orderCount ?? 0),
+      orderNumbers: Array.isArray(point.orderNumbers)
+        ? point.orderNumbers
+        : [],
     }));
+
     summary = {
       startDate,
       endDate,
@@ -446,12 +550,15 @@ export const action = async ({ request }) => {
       ordersReturned: recovered.ordersReturned,
     };
   } else if (selectedView === "partial") {
-    payloadSeries = partial.series.map((p) => ({
-      ...p,
-      revenue: Number(p.revenue ?? 0),
-      orderCount: Number(p.orderCount ?? 0),
-      orderNumbers: Array.isArray(p.orderNumbers) ? p.orderNumbers : [],
+    payloadSeries = partial.series.map((point) => ({
+      ...point,
+      revenue: Number(point.revenue ?? 0),
+      orderCount: Number(point.orderCount ?? 0),
+      orderNumbers: Array.isArray(point.orderNumbers)
+        ? point.orderNumbers
+        : [],
     }));
+
     summary = {
       startDate,
       endDate,
@@ -462,6 +569,7 @@ export const action = async ({ request }) => {
     };
   } else {
     payloadSeries = seriesBoth;
+
     summary = {
       startDate,
       endDate,
@@ -476,13 +584,19 @@ export const action = async ({ request }) => {
 
   if (exportMode === "csv") {
     if (selectedView === "both") {
-      const payloadForCsv = payloadSeries.map((p) => ({
-        ...p,
-        recoveredOrderNumbers: Array.isArray(p.recoveredOrderNumbers)
-          ? p.recoveredOrderNumbers.join(" ")
+      const payloadForCsv = payloadSeries.map((point) => ({
+        ...point,
+
+        recoveredOrderNumbers: Array.isArray(
+          point.recoveredOrderNumbers
+        )
+          ? point.recoveredOrderNumbers.join(" ")
           : "",
-        partialOrderNumbers: Array.isArray(p.partialOrderNumbers)
-          ? p.partialOrderNumbers.join(" ")
+
+        partialOrderNumbers: Array.isArray(
+          point.partialOrderNumbers
+        )
+          ? point.partialOrderNumbers.join(" ")
           : "",
       }));
 
@@ -505,58 +619,70 @@ export const action = async ({ request }) => {
         },
         summary,
       };
-    } else {
-      const payloadForCsv = payloadSeries.map((p) => ({
-        ...p,
-        orderNumbers: Array.isArray(p.orderNumbers)
-          ? p.orderNumbers.join(" ")
-          : "",
-      }));
-
-      const csv = buildCSV(payloadForCsv, [
-        "bucket",
-        "revenue",
-        "orderCount",
-        "orderNumbers",
-      ]);
-
-      const filename = `rc-value-report_${selectedView}_${startDate}_to_${endDate}_${bucketType}.csv`;
-      return {
-        export: {
-          format: "csv",
-          filename,
-          mime: "text/csv;charset=utf-8;",
-          csv,
-        },
-        summary,
-      };
     }
+
+    const payloadForCsv = payloadSeries.map((point) => ({
+      ...point,
+
+      orderNumbers: Array.isArray(point.orderNumbers)
+        ? point.orderNumbers.join(" ")
+        : "",
+    }));
+
+    const csv = buildCSV(payloadForCsv, [
+      "bucket",
+      "revenue",
+      "orderCount",
+      "orderNumbers",
+    ]);
+
+    const filename = `rc-value-report_${selectedView}_${startDate}_to_${endDate}_${bucketType}.csv`;
+
+    return {
+      export: {
+        format: "csv",
+        filename,
+        mime: "text/csv;charset=utf-8;",
+        csv,
+      },
+      summary,
+    };
   }
 
-  return { summary, series: payloadSeries };
+  return {
+    summary,
+    series: payloadSeries,
+  };
 };
 
 function RevenueChart({ series, view }) {
-  if (!Array.isArray(series) || series.length === 0) return null;
+  if (!Array.isArray(series) || series.length === 0) {
+    return null;
+  }
 
-  const normalized = series.map((p) => {
+  const normalized = series.map((point) => {
     if (view === "both") {
       return {
-        ...p,
-        recoveredRevenue: Number(p.recoveredRevenue ?? 0),
-        partialRevenue: Number(p.partialRevenue ?? 0),
+        ...point,
+        recoveredRevenue: Number(point.recoveredRevenue ?? 0),
+        partialRevenue: Number(point.partialRevenue ?? 0),
       };
     }
+
     return {
-      ...p,
-      revenue: Number(p.revenue ?? 0),
+      ...point,
+      revenue: Number(point.revenue ?? 0),
     };
   });
 
-  const money2 = (v) => {
-    const n = Number(v);
-    if (!Number.isFinite(n)) return "$0.00";
-    return `$${n.toFixed(2)}`;
+  const money2 = (value) => {
+    const number = Number(value);
+
+    if (!Number.isFinite(number)) {
+      return "$0.00";
+    }
+
+    return `$${number.toFixed(2)}`;
   };
 
   return (
@@ -564,13 +690,26 @@ function RevenueChart({ series, view }) {
       <ResponsiveContainer>
         <LineChart
           data={normalized}
-          margin={{ top: 12, right: 16, left: 0, bottom: 0 }}
+          margin={{
+            top: 12,
+            right: 16,
+            left: 0,
+            bottom: 0,
+          }}
         >
           <CartesianGrid strokeDasharray="3 3" />
-          <XAxis dataKey="bucket" minTickGap={20} />
+
+          <XAxis
+            dataKey="bucket"
+            minTickGap={20}
+          />
+
           <YAxis tickFormatter={money2} />
+
           <Tooltip formatter={(value) => money2(value)} />
+
           <Legend />
+
           {view === "both" ? (
             <>
               <Line
@@ -581,6 +720,7 @@ function RevenueChart({ series, view }) {
                 strokeWidth={2}
                 dot={false}
               />
+
               <Line
                 type="monotone"
                 dataKey="partialRevenue"
@@ -594,8 +734,16 @@ function RevenueChart({ series, view }) {
             <Line
               type="monotone"
               dataKey="revenue"
-              name={view === "partial" ? "Partial RC Value" : "Full RC Value"}
-              stroke={view === "partial" ? "#ff6b6b" : "#5c6ac4"}
+              name={
+                view === "partial"
+                  ? "Partial RC Value"
+                  : "Full RC Value"
+              }
+              stroke={
+                view === "partial"
+                  ? "#ff6b6b"
+                  : "#5c6ac4"
+              }
               strokeWidth={2}
               dot={false}
             />
@@ -613,19 +761,23 @@ export default function Index() {
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [bucket, setBucket] = useState("day");
-  const [view, setView] = useState("recovered"); // recovered | partial | both
+  const [view, setView] = useState("recovered");
 
   const isLoading =
     ["loading", "submitting"].includes(fetcher.state) &&
     fetcher.formMethod === "POST";
 
   useEffect(() => {
-    if (startDate && endDate) return;
+    if (startDate && endDate) {
+      return;
+    }
 
     const today = new Date();
     const end = today.toISOString().slice(0, 10);
+
     const d = new Date(today);
     d.setUTCDate(d.getUTCDate() - 90);
+
     const start = d.toISOString().slice(0, 10);
 
     setStartDate(start);
@@ -641,55 +793,79 @@ export default function Index() {
       ...override,
     };
 
-    fetcher.submit(payload, { method: "POST" });
+    fetcher.submit(payload, {
+      method: "POST",
+    });
   };
 
   useEffect(() => {
-    if (!startDate || !endDate) return;
+    if (!startDate || !endDate) {
+      return;
+    }
+
     submitReport();
+
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [startDate, endDate, bucket, view]);
 
   useEffect(() => {
     const exp = fetcher.data?.export;
-    if (!exp?.csv) return;
+
+    if (!exp?.csv) {
+      return;
+    }
 
     downloadTextFile(
       exp.filename,
       exp.mime || "text/csv;charset=utf-8;",
       exp.csv
     );
+
     shopify.toast.show("CSV exported");
   }, [fetcher.data?.export, shopify]);
 
   const exportCSV = () => {
-    submitReport({ exportMode: "csv" });
+    submitReport({
+      exportMode: "csv",
+    });
   };
 
   const summary = fetcher.data?.summary;
   const series = fetcher.data?.series;
 
-  const money2 = (v) => {
-    const n = Number(v);
-    if (!Number.isFinite(n)) return "$0.00";
-    return `$${n.toFixed(2)}`;
+  const money2 = (value) => {
+    const number = Number(value);
+
+    if (!Number.isFinite(number)) {
+      return "$0.00";
+    }
+
+    return `$${number.toFixed(2)}`;
   };
 
   const chartSeries = useMemo(() => {
-    if (!Array.isArray(series)) return [];
+    if (!Array.isArray(series)) {
+      return [];
+    }
+
     if (view === "both") {
-      return series.map((p) => ({
-        ...p,
-        recoveredRevenue: Number(p.recoveredRevenue ?? 0),
-        partialRevenue: Number(p.partialRevenue ?? 0),
-        recoveredOrderCount: Number(p.recoveredOrderCount ?? 0),
-        partialOrderCount: Number(p.partialOrderCount ?? 0),
+      return series.map((point) => ({
+        ...point,
+        recoveredRevenue: Number(point.recoveredRevenue ?? 0),
+        partialRevenue: Number(point.partialRevenue ?? 0),
+        recoveredOrderCount: Number(
+          point.recoveredOrderCount ?? 0
+        ),
+        partialOrderCount: Number(
+          point.partialOrderCount ?? 0
+        ),
       }));
     }
-    return series.map((p) => ({
-      ...p,
-      revenue: Number(p.revenue ?? 0),
-      orderCount: Number(p.orderCount ?? 0),
+
+    return series.map((point) => ({
+      ...point,
+      revenue: Number(point.revenue ?? 0),
+      orderCount: Number(point.orderCount ?? 0),
     }));
   }, [series, view]);
 
@@ -697,28 +873,44 @@ export default function Index() {
     <s-page heading="RC Value Revenue Report">
       <s-stack direction="block" gap="base">
         <s-section heading="Filters">
-          <s-stack direction="inline" gap="base" wrap>
+          <s-stack
+            direction="inline"
+            gap="base"
+            wrap
+          >
             <label>
               Start date
+
               <input
                 type="date"
                 value={startDate}
-                onChange={(e) => setStartDate(e.target.value)}
+                onChange={(event) =>
+                  setStartDate(event.target.value)
+                }
               />
             </label>
 
             <label>
               End date
+
               <input
                 type="date"
                 value={endDate}
-                onChange={(e) => setEndDate(e.target.value)}
+                onChange={(event) =>
+                  setEndDate(event.target.value)
+                }
               />
             </label>
 
             <label>
               Bucket
-              <select value={bucket} onChange={(e) => setBucket(e.target.value)}>
+
+              <select
+                value={bucket}
+                onChange={(event) =>
+                  setBucket(event.target.value)
+                }
+              >
                 <option value="day">Day</option>
                 <option value="week">Week</option>
                 <option value="month">Month</option>
@@ -728,7 +920,13 @@ export default function Index() {
 
             <label>
               View
-              <select value={view} onChange={(e) => setView(e.target.value)}>
+
+              <select
+                value={view}
+                onChange={(event) =>
+                  setView(event.target.value)
+                }
+              >
                 <option value="recovered">Recovered</option>
                 <option value="partial">Partial</option>
                 <option value="both">Both</option>
@@ -738,7 +936,11 @@ export default function Index() {
             <s-button
               variant="tertiary"
               onClick={exportCSV}
-              disabled={isLoading || !Array.isArray(series) || series.length === 0}
+              disabled={
+                isLoading ||
+                !Array.isArray(series) ||
+                series.length === 0
+              }
             >
               Export CSV
             </s-button>
@@ -759,21 +961,33 @@ export default function Index() {
                     Total RC Value revenue ({summary.view}):{" "}
                     {money2(summary.totalRevenue)}
                   </s-paragraph>
-                  <s-paragraph>Orders in range: {summary.ordersReturned}</s-paragraph>
+
                   <s-paragraph>
-                    Range: {summary.startDate} → {summary.endDate} (bucket: {summary.bucket})
+                    Orders in range: {summary.ordersReturned}
+                  </s-paragraph>
+
+                  <s-paragraph>
+                    Range: {summary.startDate} → {summary.endDate}{" "}
+                    (bucket: {summary.bucket})
                   </s-paragraph>
                 </>
               ) : (
                 <>
                   <s-paragraph>
-                    Recovered total: {money2(summary.recoveredTotalRevenue)} (orders: {summary.recoveredOrdersReturned})
+                    Recovered total:{" "}
+                    {money2(summary.recoveredTotalRevenue)}{" "}
+                    (orders: {summary.recoveredOrdersReturned})
                   </s-paragraph>
+
                   <s-paragraph>
-                    Partial total: {money2(summary.partialTotalRevenue)} (orders: {summary.partialOrdersReturned})
+                    Partial total:{" "}
+                    {money2(summary.partialTotalRevenue)}{" "}
+                    (orders: {summary.partialOrdersReturned})
                   </s-paragraph>
+
                   <s-paragraph>
-                    Range: {summary.startDate} → {summary.endDate} (bucket: {summary.bucket})
+                    Range: {summary.startDate} → {summary.endDate}{" "}
+                    (bucket: {summary.bucket})
                   </s-paragraph>
                 </>
               )}
@@ -781,17 +995,24 @@ export default function Index() {
           </s-section>
         )}
 
-        {Array.isArray(chartSeries) && chartSeries.length > 0 && (
-          <s-section heading="Revenue over time">
-            <RevenueChart series={chartSeries} view={view} />
-          </s-section>
-        )}
+        {Array.isArray(chartSeries) &&
+          chartSeries.length > 0 && (
+            <s-section heading="Revenue over time">
+              <RevenueChart
+                series={chartSeries}
+                view={view}
+              />
+            </s-section>
+          )}
 
-        {Array.isArray(chartSeries) && chartSeries.length === 0 && (
-          <s-section heading="Revenue over time">
-            <s-paragraph>No matching orders found for the selected range.</s-paragraph>
-          </s-section>
-        )}
+        {Array.isArray(chartSeries) &&
+          chartSeries.length === 0 && (
+            <s-section heading="Revenue over time">
+              <s-paragraph>
+                No matching orders found for the selected range.
+              </s-paragraph>
+            </s-section>
+          )}
       </s-stack>
     </s-page>
   );
