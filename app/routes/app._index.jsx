@@ -88,6 +88,48 @@ function buildCSV(rows, headers) {
   return [headerLine, ...lines].join("\n");
 }
 
+function getAbandonedCheckoutIdCandidates(checkoutId) {
+  const rawId = String(checkoutId || "").trim();
+
+  if (!rawId) {
+    return [];
+  }
+
+  // Supports both GraphQL IDs and numeric IDs in customer tags.
+  const numericId = rawId.split("/").pop();
+
+  return [...new Set([rawId, numericId].filter(Boolean))];
+}
+
+function customerHasAbandonedCheckoutRecoveryTag(
+  customerTags,
+  abandonedCheckoutId
+) {
+  const idCandidates =
+    getAbandonedCheckoutIdCandidates(abandonedCheckoutId);
+
+  return customerTags.some((tag) => {
+    if (typeof tag !== "string") {
+      return false;
+    }
+
+    const normalizedTag = tag.trim();
+
+    return idCandidates.some((id) => {
+      const fullRecoveryPrefix = `FRC${id}R`;
+      const eightyPercentTag = `80%RC${id}`;
+
+      // Matches:
+      // FRC<id>R<recovered value>V<total value>
+      // 80%RC<id>
+      return (
+        normalizedTag.startsWith(fullRecoveryPrefix) ||
+        normalizedTag === eightyPercentTag
+      );
+    });
+  });
+}
+
 function downloadTextFile(filename, mime, text) {
   const blob = new Blob([text], { type: mime });
   const url = URL.createObjectURL(blob);
@@ -419,6 +461,135 @@ async function fetchPartialSeriesByTag({
   };
 }
 
+async function fetchMissingAbandonedCheckoutTagReport({ admin }) {
+  const rows = [];
+
+  let hasNextPage = true;
+  let cursor = null;
+
+  while (hasNextPage) {
+    const query = `
+      query AbandonedCheckoutsForMissingRecoveryTags(
+        $first: Int!
+        $after: String
+      ) {
+        abandonedCheckouts(first: $first, after: $after) {
+          edges {
+            cursor
+            node {
+              id
+              totalPriceSet {
+                shopMoney {
+                  amount
+                }
+              }
+              customer {
+                id
+                displayName
+                firstName
+                lastName
+                phone
+                email
+                tags
+              }
+            }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+        }
+      }
+    `;
+
+    const response = await admin.graphql(`#graphql\n${query}`, {
+      variables: {
+        first: 100,
+        after: cursor,
+      },
+    });
+
+    const data = await response.json();
+
+    if (data?.errors?.length) {
+      throw new Error(
+        data.errors.map((error) => error.message).join("; ")
+      );
+    }
+
+    const connection = data?.data?.abandonedCheckouts;
+
+    if (!connection) {
+      break;
+    }
+
+    for (const edge of connection.edges) {
+      const checkout = edge.node;
+
+      // A checkout without an associated customer cannot be checked
+      // against customer profile tags.
+      if (!checkout.customer) {
+        continue;
+      }
+
+      const customerTags = normalizeShopifyTags(
+        checkout.customer.tags
+      );
+
+      const hasMatchingRecoveryTag =
+        customerHasAbandonedCheckoutRecoveryTag(
+          customerTags,
+          checkout.id
+        );
+
+      if (hasMatchingRecoveryTag) {
+        continue;
+      }
+
+      const customer = checkout.customer;
+
+      const customerName =
+        customer.displayName ||
+        [customer.firstName, customer.lastName]
+          .filter(Boolean)
+          .join(" ") ||
+        "";
+
+      rows.push({
+        abandonedCheckoutId: checkout.id,
+        abandonedCheckoutValue:
+          checkout.totalPriceSet?.shopMoney?.amount ?? "",
+        customerName,
+        customerPhone: customer.phone ?? "",
+        customerEmail: customer.email ?? "",
+      });
+    }
+
+    hasNextPage = connection.pageInfo.hasNextPage;
+    cursor = connection.pageInfo.endCursor;
+  }
+
+  const csv = buildCSV(rows, [
+    "abandonedCheckoutId",
+    "abandonedCheckoutValue",
+    "customerName",
+    "customerPhone",
+    "customerEmail",
+  ]);
+
+  return {
+    export: {
+      format: "csv",
+      filename: `unrecovered-abandoned-checkout-report-${toISODateUTCString(
+        new Date()
+      )}.csv`,
+      mime: "text/csv;charset=utf-8;",
+      csv,
+    },
+    missingCount: rows.length,
+  };
+}
+
 export const action = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
   const formData = await request.formData();
@@ -429,6 +600,10 @@ export const action = async ({ request }) => {
   const bucket = formData.get("bucket");
   const exportMode = formData.get("exportMode");
   const view = formData.get("view");
+
+  if (exportMode === "missingAbandonedCheckoutTags") {
+  return fetchMissingAbandonedCheckoutTagReport({ admin });
+  }
 
   const FULL_TAG_NAME = "Full-AC-Revenue-Recovery";
   const PARTIAL_TAG_NAME = "Partial-AC-Revenue-Recovery";
@@ -821,14 +996,37 @@ export default function Index() {
       exp.csv
     );
 
-    shopify.toast.show("CSV exported");
+    if (
+      exp.filename.startsWith(
+        "unrecovered-abandoned-checkout"
+      )
+    ) {
+      shopify.toast.show(
+        "Missing recovery tag report exported"
+      );
+    } else {
+      shopify.toast.show("CSV exported");
+    }
   }, [fetcher.data?.export, shopify]);
+
 
   const exportCSV = () => {
     submitReport({
       exportMode: "csv",
     });
   };
+
+  const exportMissingAbandonedCheckoutReport = () => {
+  fetcher.submit(
+    {
+      exportMode: "missingAbandonedCheckoutTags",
+    },
+    {
+      method: "POST",
+    }
+    );
+  };
+
 
   const summary = fetcher.data?.summary;
   const series = fetcher.data?.series;
@@ -943,6 +1141,13 @@ export default function Index() {
               }
             >
               Export CSV
+            </s-button>
+            <s-button
+              variant="tertiary"
+              onClick={exportMissingAbandonedCheckoutReport}
+              disabled={isLoading}
+            >
+            Export Unrecovered AC Data
             </s-button>
           </s-stack>
         </s-section>
