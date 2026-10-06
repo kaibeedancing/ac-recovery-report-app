@@ -478,6 +478,7 @@ async function fetchMissingAbandonedCheckoutTagReport({ admin }) {
             cursor
             node {
               id
+              createdAt
               totalPriceSet {
                 shopMoney {
                   amount
@@ -557,6 +558,7 @@ async function fetchMissingAbandonedCheckoutTagReport({ admin }) {
 
       rows.push({
         abandonedCheckoutId: checkout.id,
+        abandonmentTime: checkout.createdAt ?? "",
         abandonedCheckoutValue:
           checkout.totalPriceSet?.shopMoney?.amount ?? "",
         customerName,
@@ -569,8 +571,16 @@ async function fetchMissingAbandonedCheckoutTagReport({ admin }) {
     cursor = connection.pageInfo.endCursor;
   }
 
+  rows.sort((a, b) => {
+  const timeA = new Date(a.abandonmentTime).getTime();
+  const timeB = new Date(b.abandonmentTime).getTime();
+
+  return timeB - timeA;
+  });
+
   const csv = buildCSV(rows, [
     "abandonedCheckoutId",
+    "abandonmentTime",
     "abandonedCheckoutValue",
     "customerName",
     "customerPhone",
