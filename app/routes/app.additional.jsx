@@ -104,14 +104,14 @@ export async function action({ request }) {
     }
 
     // cleanup-offer-eligible-tags
-    // remove all tags from customers ONLY that CONTAIN "5%-Offer-Eligible" or "10%-Offer-Eligible"
+    // remove all tags from customers ONLY that CONTAIN "5%-Offer-Eligible", "10%-Offer-Eligible", or "ACR-Email-Sent"
     return {
       scope: "customers_only",
       shouldCleanTags: (tags) => {
         if (!Array.isArray(tags)) return false;
         return tags.some((t) => {
           const str = String(t || "");
-          return str.includes("5%-Offer-Eligible") || str.includes("10%-Offer-Eligible");
+          return str.includes("5%-Offer-Eligible") || str.includes("10%-Offer-Eligible") || str.includes("ACR-Email-Sent");
         });
       },
       cleanTags: () => {
