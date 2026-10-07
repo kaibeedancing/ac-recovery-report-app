@@ -104,21 +104,39 @@ export async function action({ request }) {
     }
 
     // cleanup-offer-eligible-tags
-    // remove all tags from customers ONLY that CONTAIN "5%-Offer-Eligible", "10%-Offer-Eligible", or "ACR-Email-Sent"
-    return {
-      scope: "customers_only",
-      shouldCleanTags: (tags) => {
-        if (!Array.isArray(tags)) return false;
-        return tags.some((t) => {
-          const str = String(t || "");
-          return str.includes("5%-Offer-Eligible") || str.includes("10%-Offer-Eligible") || str.includes("ACR-Email-Sent");
-        });
-      },
-      cleanTags: () => {
-        // remove ALL tags for matching customers
-        return [];
-      },
-    };
+    // remove only tags from customers that contain
+    // "5%-Offer-Eligible", "10%-Offer-Eligible", or "ACR-Email-Sent"
+    if (policyIntent === "cleanup-offer-eligible-tags") {
+      const TARGET_TAGS = [
+        "5%-Offer-Eligible",
+        "10%-Offer-Eligible",
+        "ACR-Email-Sent",
+      ];
+
+      return {
+        scope: "customers_only",
+
+        shouldCleanTags: (tags) => {
+          if (!Array.isArray(tags)) return false;
+
+          return tags.some((t) => {
+            const str = String(t || "");
+            return TARGET_TAGS.some((target) => str.includes(target));
+          });
+        },
+
+        cleanTags: (tags) => {
+          if (!Array.isArray(tags)) return tags;
+
+          const out = tags.filter((t) => {
+            const str = String(t || "");
+            return !TARGET_TAGS.some((target) => str.includes(target));
+          });
+
+          return [...new Set(out)];
+        },
+      };
+    }
   };
 
   const policy = buildCleanupPolicy(intent);
@@ -429,7 +447,7 @@ export default function AdditionalPage() {
 
           <s-list-item>
             Button 3: customers only; if a customer has a tag containing{" "}
-            <code>5%-Offer-Eligible</code> or <code>10%-Offer-Eligible</code>, remove <em>all</em> their tags.
+            <code>5%-Offer-Eligible</code> or <code>10%-Offer-Eligible</code> or <code>ACR-Email-Sent</code>, remove those tags.
           </s-list-item>
         </s-unordered-list>
       </s-section>
