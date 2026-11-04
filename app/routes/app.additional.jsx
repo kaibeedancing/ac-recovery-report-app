@@ -14,6 +14,175 @@ export async function action({ request }) {
   const form = await request.formData();
   const intent = form.get("intent");
 
+  // Export physical product variants as a CSV.
+  // This request uses API version 2027-01 without changing the app's
+  // default Shopify API version.
+  if (intent === "export-physical-products") {
+    const submittedPassword = String(form.get("password") || "");
+
+    if (submittedPassword !== HARDCODED_PASSWORD) {
+      return {
+        exportError: "Access denied: incorrect password.",
+      };
+    }
+
+    try {
+      const { session } = await authenticate.admin(request);
+
+      const csvCell = (value) =>
+        `"${String(value ?? "").replace(/"/g, '""')}"`;
+
+      const withUnit = (value, unit) =>
+        value == null ? "" : `${value}${unit ? ` ${unit}` : ""}`;
+
+      const rows = [
+        [
+          "Product",
+          "Variant",
+          "SKU",
+          "Weight",
+          "Packed Product Size Length",
+          "Packed Product Size Width",
+          "Packed Product Size Height",
+        ]
+          .map(csvCell)
+          .join(","),
+      ];
+
+      const query = `#graphql
+        query PhysicalProductVariants($first: Int!, $after: String) {
+          productVariants(first: $first, after: $after) {
+            edges {
+              cursor
+              node {
+                title
+                sku
+                product {
+                  title
+                  status
+                }
+                inventoryItem {
+                  requiresShipping
+                  measurement {
+                    weight {
+                      value
+                      unit
+                    }
+                    packedDimensions {
+                      length
+                      width
+                      height
+                      unit
+                    }
+                  }
+                }
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+      `;
+
+      let cursor = null;
+
+      do {
+        const response = await fetch(
+          `https://${session.shop}/admin/api/2027-01/graphql.json`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Shopify-Access-Token": session.accessToken,
+            },
+            body: JSON.stringify({
+              query,
+              variables: { first: 250, after: cursor },
+            }),
+          }
+        );
+
+        const payload = await response.json();
+
+        if (!response.ok || payload?.errors?.length) {
+          const messages = payload?.errors
+            ?.map((error) => error.message)
+            .join("; ");
+
+          throw new Error(
+            messages || `Shopify API request failed (${response.status}).`
+          );
+        }
+
+        const connection = payload?.data?.productVariants;
+
+        if (!connection) {
+          throw new Error(
+            "No productVariants connection found in GraphQL response."
+          );
+        }
+
+        for (const edge of connection.edges || []) {
+          const variant = edge?.node;
+          const inventoryItem = variant?.inventoryItem;
+
+          // Include only variants that require shipping.
+          if (!variant || inventoryItem?.requiresShipping !== true) continue;
+          // Include only variants of active products that require shipping.
+          if (
+            !variant ||
+            variant.product?.status !== "ACTIVE" ||
+            inventoryItem?.requiresShipping !== true
+          ) {
+            continue;
+          }
+
+
+          const weight = inventoryItem.measurement?.weight;
+          const dimensions = inventoryItem.measurement?.packedDimensions;
+
+          rows.push(
+            [
+              variant.product?.title,
+              variant.title,
+              variant.sku,
+              withUnit(weight?.value, weight?.unit),
+              withUnit(dimensions?.length, dimensions?.unit),
+              withUnit(dimensions?.width, dimensions?.unit),
+              withUnit(dimensions?.height, dimensions?.unit),
+            ]
+              .map(csvCell)
+              .join(",")
+          );
+        }
+
+        if (!connection.pageInfo?.hasNextPage) break;
+
+        cursor = connection.pageInfo.endCursor;
+
+        if (!cursor) {
+          throw new Error(
+            "Pagination indicated another page but returned no cursor."
+          );
+        }
+      } while (true);
+
+      return {
+        csv: `\uFEFF${rows.join("\r\n")}`,
+        filename: "physical-products.csv",
+      };
+    } catch (error) {
+      return {
+        exportError:
+          error instanceof Error
+            ? error.message
+            : "The product CSV export failed.",
+      };
+    }
+  }
+
   if (
     intent !== "cleanup-recovery-tags" &&
     intent !== "cleanup-ac-revenue-recovery-tags" &&
@@ -38,8 +207,11 @@ export async function action({ request }) {
     return resp;
   };
 
-  const getCustomersConn = (payload) => payload?.data?.customers ?? payload?.customers ?? null;
-  const getOrdersConn = (payload) => payload?.data?.orders ?? payload?.orders ?? null;
+  const getCustomersConn = (payload) =>
+    payload?.data?.customers ?? payload?.customers ?? null;
+
+  const getOrdersConn = (payload) =>
+    payload?.data?.orders ?? payload?.orders ?? null;
 
   // -------- tag cleanup policy per intent --------
   const buildCleanupPolicy = (policyIntent) => {
@@ -62,14 +234,15 @@ export async function action({ request }) {
 
       return {
         scope: "customers_and_orders",
-        shouldCleanTags: (tags) => Array.isArray(tags) && tags.some((t) => TARGET_TAGS.has(t)),
+        shouldCleanTags: (tags) =>
+          Array.isArray(tags) && tags.some((tag) => TARGET_TAGS.has(tag)),
         cleanTags: (tags) => {
           if (!Array.isArray(tags)) return tags;
 
-          let out = tags.filter((t) => !TARGET_TAGS.has(t));
+          let out = tags.filter((tag) => !TARGET_TAGS.has(tag));
 
-          out = out.filter((t) => {
-            const str = String(t || "");
+          out = out.filter((tag) => {
+            const str = String(tag || "");
             return !SUBSTRING_MATCHES.some((needle) => str.includes(needle));
           });
 
@@ -79,23 +252,29 @@ export async function action({ request }) {
     }
 
     if (policyIntent === "cleanup-ac-revenue-recovery-tags") {
-      const TARGET_TAGS = new Set(["Full-AC-Revenue-Recovery", "Partial-AC-Revenue-Recovery"]);
+      const TARGET_TAGS = new Set([
+        "Full-AC-Revenue-Recovery",
+        "Partial-AC-Revenue-Recovery",
+      ]);
       const PREFIXES_TO_REMOVE = ["FRC", "PRC"];
 
       return {
         scope: "customers_and_orders",
-        // exact match triggers cleanup on that record
-        shouldCleanTags: (tags) => Array.isArray(tags) && tags.some((t) => TARGET_TAGS.has(t)),
+        // Exact match triggers cleanup on that record.
+        shouldCleanTags: (tags) =>
+          Array.isArray(tags) && tags.some((tag) => TARGET_TAGS.has(tag)),
         cleanTags: (tags) => {
           if (!Array.isArray(tags)) return tags;
 
-          // remove exact target tags
-          let out = tags.filter((t) => !TARGET_TAGS.has(t));
+          // Remove exact target tags.
+          let out = tags.filter((tag) => !TARGET_TAGS.has(tag));
 
-          // remove any other tags that start with "FRC" or "PRC"
-          out = out.filter((t) => {
-            const str = String(t || "");
-            return !PREFIXES_TO_REMOVE.some((prefix) => str.startsWith(prefix));
+          // Remove any other tags that start with "FRC" or "PRC".
+          out = out.filter((tag) => {
+            const str = String(tag || "");
+            return !PREFIXES_TO_REMOVE.some((prefix) =>
+              str.startsWith(prefix)
+            );
           });
 
           return [...new Set(out)];
@@ -104,8 +283,8 @@ export async function action({ request }) {
     }
 
     // cleanup-offer-eligible-tags
-    // remove only tags from customers that contain
-    // "5%-Offer-Eligible", "10%-Offer-Eligible", or "ACR-Email-Sent"
+    // Remove only tags from customers that contain
+    // "5%-Offer-Eligible", "10%-Offer-Eligible", or "ACR-Email-Sent".
     if (policyIntent === "cleanup-offer-eligible-tags") {
       const TARGET_TAGS = [
         "5%-Offer-Eligible",
@@ -119,8 +298,8 @@ export async function action({ request }) {
         shouldCleanTags: (tags) => {
           if (!Array.isArray(tags)) return false;
 
-          return tags.some((t) => {
-            const str = String(t || "");
+          return tags.some((tag) => {
+            const str = String(tag || "");
             return TARGET_TAGS.some((target) => str.includes(target));
           });
         },
@@ -128,8 +307,8 @@ export async function action({ request }) {
         cleanTags: (tags) => {
           if (!Array.isArray(tags)) return tags;
 
-          const out = tags.filter((t) => {
-            const str = String(t || "");
+          const out = tags.filter((tag) => {
+            const str = String(tag || "");
             return !TARGET_TAGS.some((target) => str.includes(target));
           });
 
@@ -164,7 +343,10 @@ export async function action({ request }) {
 
     const parsed = await parseGraphqlResult(resp);
     const errors = parsed?.data?.customerUpdate?.userErrors || [];
-    if (errors.length) throw new Error(errors.map((e) => e.message).join("; "));
+
+    if (errors.length) {
+      throw new Error(errors.map((error) => error.message).join("; "));
+    }
   };
 
   const updateOrderTags = async (orderGid, nextTags) => {
@@ -190,7 +372,10 @@ export async function action({ request }) {
 
     const parsed = await parseGraphqlResult(resp);
     const errors = parsed?.data?.orderUpdate?.userErrors || [];
-    if (errors.length) throw new Error(errors.map((e) => e.message).join("; "));
+
+    if (errors.length) {
+      throw new Error(errors.map((error) => error.message).join("; "));
+    }
   };
 
   const CUSTOMER_QUERY = `
@@ -234,9 +419,10 @@ export async function action({ request }) {
   let customersEdgesSeen = 0;
   let customersSample = null;
 
-  // Customers loop (always runs; policy decides whether to modify)
+  // Customers loop (always runs; policy decides whether to modify).
   {
     let cursor = null;
+
     while (true) {
       const resp = await admin.graphql(`#graphql\n${CUSTOMER_QUERY}`, {
         variables: { first: 250, after: cursor },
@@ -267,12 +453,19 @@ export async function action({ request }) {
 
         const originalStr = Array.isArray(tags) ? tags.join(",") : "";
         const nextStr = Array.isArray(nextTags) ? nextTags.join(",") : "";
+
         if (originalStr === nextStr) continue;
 
         await updateCustomerTags(node.id, nextTags);
         customersUpdated++;
 
-        if (!customersSample) customersSample = { id: node.id, before: tags, after: nextTags };
+        if (!customersSample) {
+          customersSample = {
+            id: node.id,
+            before: tags,
+            after: nextTags,
+          };
+        }
       }
 
       if (!conn.pageInfo?.hasNextPage) break;
@@ -285,9 +478,10 @@ export async function action({ request }) {
   let ordersEdgesSeen = 0;
   let ordersSample = null;
 
-  // Orders loop only when policy scope includes orders
+  // Orders loop only when policy scope includes orders.
   if (policy.scope === "customers_and_orders") {
     let cursor = null;
+
     while (true) {
       const resp = await admin.graphql(`#graphql\n${ORDERS_QUERY}`, {
         variables: { first: 250, after: cursor },
@@ -323,12 +517,19 @@ export async function action({ request }) {
 
         const originalStr = Array.isArray(tags) ? tags.join(",") : "";
         const nextStr = Array.isArray(nextTags) ? nextTags.join(",") : "";
+
         if (originalStr === nextStr) continue;
 
         await updateOrderTags(node.id, nextTags);
         ordersUpdated++;
 
-        if (!ordersSample) ordersSample = { id: node.id, before: tags, after: nextTags };
+        if (!ordersSample) {
+          ordersSample = {
+            id: node.id,
+            before: tags,
+            after: nextTags,
+          };
+        }
       }
 
       if (!conn.pageInfo?.hasNextPage) break;
@@ -355,10 +556,33 @@ export async function action({ request }) {
 
 export default function AdditionalPage() {
   const fetcher = useFetcher();
-  const busy = fetcher.state !== "idle";
+  const exportFetcher = useFetcher();
 
-  // Shared form ref fields
+  const busy =
+    fetcher.state !== "idle" || exportFetcher.state !== "idle";
+
   const [passwordValue, setPasswordValue] = React.useState("");
+
+  React.useEffect(() => {
+    const data = exportFetcher.data;
+
+    if (!data?.csv) return;
+
+    const blob = new Blob([data.csv], {
+      type: "text/csv;charset=utf-8",
+    });
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    link.href = url;
+    link.download = data.filename || "physical-products.csv";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, [exportFetcher.data]);
 
   const submitIntent = (intentValue) => {
     if (busy) return;
@@ -369,9 +593,19 @@ export default function AdditionalPage() {
     if (!formEl || !intentEl) return;
 
     intentEl.value = intentValue;
-
-    // Submit the shared form
     formEl.requestSubmit();
+  };
+
+  const submitExport = () => {
+    if (busy) return;
+
+    const formData = new FormData();
+    formData.set("intent", "export-physical-products");
+    formData.set("password", passwordValue);
+
+    exportFetcher.submit(formData, {
+      method: "post",
+    });
   };
 
   return (
@@ -382,9 +616,17 @@ export default function AdditionalPage() {
         </s-paragraph>
 
         <fetcher.Form method="post" id="tag-cleanup-form">
-          {/* Single password block */}
-          <input type="hidden" name="intent" id="tag-cleanup-intent" value="" />
-          <input type="hidden" name="password" value={passwordValue} />
+          <input
+            type="hidden"
+            name="intent"
+            id="tag-cleanup-intent"
+            value=""
+          />
+          <input
+            type="hidden"
+            name="password"
+            value={passwordValue}
+          />
 
           <input
             type="password"
@@ -392,22 +634,32 @@ export default function AdditionalPage() {
             autoComplete="current-password"
             style={{ width: 260 }}
             value={passwordValue}
-            onChange={(e) => setPasswordValue(e.target.value)}
+            onChange={(event) => setPasswordValue(event.target.value)}
           />
 
           <div style={{ marginTop: 12 }}>
-            <s-button type="button" onClick={() => submitIntent("cleanup-recovery-tags")} disabled={busy}>
-              {busy ? "Running..." : "Check & remove current test recovery tags"}
+            <s-button
+              type="button"
+              onClick={() => submitIntent("cleanup-recovery-tags")}
+              disabled={busy}
+            >
+              {busy
+                ? "Running..."
+                : "Check & remove current test recovery tags"}
             </s-button>
           </div>
 
           <div style={{ marginTop: 12 }}>
             <s-button
               type="button"
-              onClick={() => submitIntent("cleanup-ac-revenue-recovery-tags")}
+              onClick={() =>
+                submitIntent("cleanup-ac-revenue-recovery-tags")
+              }
               disabled={busy}
             >
-              {busy ? "Running..." : "Check & remove AC revenue recovery tags"}
+              {busy
+                ? "Running..."
+                : "Check & remove AC revenue recovery tags"}
             </s-button>
           </div>
 
@@ -417,7 +669,9 @@ export default function AdditionalPage() {
               onClick={() => submitIntent("cleanup-offer-eligible-tags")}
               disabled={busy}
             >
-              {busy ? "Running..." : "Check & clear Offer-Eligible customer tags"}
+              {busy
+                ? "Running..."
+                : "Check & clear Offer-Eligible customer tags"}
             </s-button>
           </div>
 
@@ -427,27 +681,51 @@ export default function AdditionalPage() {
             </s-paragraph>
           ) : null}
         </fetcher.Form>
+
+        <div style={{ marginTop: 12 }}>
+          <s-button
+            type="button"
+            onClick={submitExport}
+            disabled={busy}
+          >
+            {exportFetcher.state !== "idle"
+              ? "Exporting..."
+              : "Export physical products CSV"}
+          </s-button>
+        </div>
+
+        {exportFetcher.data?.exportError ? (
+          <s-paragraph style={{ marginTop: 12, whiteSpace: "pre-wrap" }}>
+            Export failed: {exportFetcher.data.exportError}
+          </s-paragraph>
+        ) : null}
       </s-section>
 
       <s-section slot="aside" heading="Targets">
         <s-unordered-list>
           <s-list-item>
             Button 1: removes exact tags{" "}
-            <code>Partial-Cart-Recovery-Test</code>, <code>Organic-Cart-Recovery-Test</code>,{" "}
-            <code>Recovered-Self-Checkout-Test</code> and also removes any other tags containing{" "}
-            <code>FRC</code>, <code>PRC</code>, <code>RC ID</code>, <code>RC Value</code>,{" "}
+            <code>Partial-Cart-Recovery-Test</code>,{" "}
+            <code>Organic-Cart-Recovery-Test</code>,{" "}
+            <code>Recovered-Self-Checkout-Test</code> and also removes any
+            other tags containing <code>FRC</code>, <code>PRC</code>,{" "}
+            <code>RC ID</code>, <code>RC Value</code>,{" "}
             <code>Partial RC</code>, <code>Full RC</code>, <code>80%</code>.
           </s-list-item>
 
           <s-list-item>
             Button 2: exact match{" "}
-            <code>Full-AC-Revenue-Recovery</code> / <code>Partial-AC-Revenue-Recovery</code>, remove those tags,
-            and also remove any other tags that start with <code>FRC</code> or <code>PRC</code>.
+            <code>Full-AC-Revenue-Recovery</code> /{" "}
+            <code>Partial-AC-Revenue-Recovery</code>, removes those tags, and
+            also removes any other tags that start with <code>FRC</code> or{" "}
+            <code>PRC</code>.
           </s-list-item>
 
           <s-list-item>
             Button 3: customers only; if a customer has a tag containing{" "}
-            <code>5%-Offer-Eligible</code> or <code>10%-Offer-Eligible</code> or <code>ACR-Email-Sent</code>, remove those tags.
+            <code>5%-Offer-Eligible</code>,{" "}
+            <code>10%-Offer-Eligible</code>, or <code>ACR-Email-Sent</code>,
+            removes those tags.
           </s-list-item>
         </s-unordered-list>
       </s-section>
