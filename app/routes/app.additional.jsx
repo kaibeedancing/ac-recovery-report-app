@@ -14,10 +14,16 @@ export async function action({ request }) {
   const form = await request.formData();
   const intent = form.get("intent");
 
+  const isMissingDimensionsExport =
+    intent === "export-missing-dimensions";
+
   // Export physical product variants as a CSV.
   // This request uses API version 2027-01 without changing the app's
   // default Shopify API version.
-  if (intent === "export-physical-products") {
+  if (
+    intent === "export-physical-products" ||
+    isMissingDimensionsExport
+  ) {
     const submittedPassword = String(form.get("password") || "");
 
     if (submittedPassword !== HARDCODED_PASSWORD) {
@@ -35,19 +41,22 @@ export async function action({ request }) {
       const withUnit = (value, unit) =>
         value == null ? "" : `${value}${unit ? ` ${unit}` : ""}`;
 
-      const rows = [
-        [
-          "Product",
-          "Variant",
-          "SKU",
-          "Weight",
+      const isEmptyOrZero = (value) =>
+        value == null ||
+        String(value).trim() === "" ||
+        Number(value) === 0;
+
+      const headers = ["Product", "Variant", "SKU", "Weight"];
+
+      if (!isMissingDimensionsExport) {
+        headers.push(
           "Packed Product Size Length",
           "Packed Product Size Width",
-          "Packed Product Size Height",
-        ]
-          .map(csvCell)
-          .join(","),
-      ];
+          "Packed Product Size Height"
+        );
+      }
+
+      const rows = [headers.map(csvCell).join(",")];
 
       const query = `#graphql
         query PhysicalProductVariants($first: Int!, $after: String) {
@@ -128,8 +137,6 @@ export async function action({ request }) {
           const variant = edge?.node;
           const inventoryItem = variant?.inventoryItem;
 
-          // Include only variants that require shipping.
-          if (!variant || inventoryItem?.requiresShipping !== true) continue;
           // Include only variants of active products that require shipping.
           if (
             !variant ||
@@ -139,23 +146,37 @@ export async function action({ request }) {
             continue;
           }
 
-
           const weight = inventoryItem.measurement?.weight;
           const dimensions = inventoryItem.measurement?.packedDimensions;
 
-          rows.push(
-            [
-              variant.product?.title,
-              variant.title,
-              variant.sku,
-              withUnit(weight?.value, weight?.unit),
+          // For this export, include variants with all missing or zero packed dimension.
+          if (
+            isMissingDimensionsExport &&
+            ![
+              dimensions?.length,
+              dimensions?.width,
+              dimensions?.height,
+            ].every(isEmptyOrZero)
+          ) {
+            continue;
+          }
+
+          const row = [
+            variant.product?.title,
+            variant.title,
+            variant.sku,
+            withUnit(weight?.value, weight?.unit),
+          ];
+
+          if (!isMissingDimensionsExport) {
+            row.push(
               withUnit(dimensions?.length, dimensions?.unit),
               withUnit(dimensions?.width, dimensions?.unit),
-              withUnit(dimensions?.height, dimensions?.unit),
-            ]
-              .map(csvCell)
-              .join(",")
-          );
+              withUnit(dimensions?.height, dimensions?.unit)
+            );
+          }
+
+          rows.push(row.map(csvCell).join(","));
         }
 
         if (!connection.pageInfo?.hasNextPage) break;
@@ -171,7 +192,9 @@ export async function action({ request }) {
 
       return {
         csv: `\uFEFF${rows.join("\r\n")}`,
-        filename: "physical-products.csv",
+        filename: isMissingDimensionsExport
+          ? "products-missing-packed-dimensions.csv"
+          : "physical-products.csv",
       };
     } catch (error) {
       return {
@@ -192,6 +215,7 @@ export async function action({ request }) {
   }
 
   const submittedPassword = String(form.get("password") || "");
+
   if (submittedPassword !== HARDCODED_PASSWORD) {
     return {
       summary: "Access denied: incorrect password.",
@@ -434,8 +458,18 @@ export async function action({ request }) {
       if (!conn) {
         return {
           summary: "No customers connection found in response",
-          customers: { checked: 0, updated: 0, edgesSeen: 0, sample: null },
-          orders: { checked: 0, updated: 0, edgesSeen: 0, sample: null },
+          customers: {
+            checked: 0,
+            updated: 0,
+            edgesSeen: 0,
+            sample: null,
+          },
+          orders: {
+            checked: 0,
+            updated: 0,
+            edgesSeen: 0,
+            sample: null,
+          },
         };
       }
 
@@ -499,7 +533,12 @@ export async function action({ request }) {
             edgesSeen: customersEdgesSeen,
             sample: customersSample,
           },
-          orders: { checked: 0, updated: 0, edgesSeen: 0, sample: null },
+          orders: {
+            checked: 0,
+            updated: 0,
+            edgesSeen: 0,
+            sample: null,
+          },
         };
       }
 
@@ -596,11 +635,11 @@ export default function AdditionalPage() {
     formEl.requestSubmit();
   };
 
-  const submitExport = () => {
+  const submitExport = (intent = "export-physical-products") => {
     if (busy) return;
 
     const formData = new FormData();
-    formData.set("intent", "export-physical-products");
+    formData.set("intent", intent);
     formData.set("password", passwordValue);
 
     exportFetcher.submit(formData, {
@@ -685,12 +724,24 @@ export default function AdditionalPage() {
         <div style={{ marginTop: 12 }}>
           <s-button
             type="button"
-            onClick={submitExport}
+            onClick={() => submitExport("export-physical-products")}
             disabled={busy}
           >
             {exportFetcher.state !== "idle"
               ? "Exporting..."
               : "Export physical products CSV"}
+          </s-button>
+        </div>
+
+        <div style={{ marginTop: 12 }}>
+          <s-button
+            type="button"
+            onClick={() => submitExport("export-missing-dimensions")}
+            disabled={busy}
+          >
+            {exportFetcher.state !== "idle"
+              ? "Exporting..."
+              : "Export products missing packed dimensions"}
           </s-button>
         </div>
 
