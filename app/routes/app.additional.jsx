@@ -3,7 +3,7 @@ import { useFetcher } from "react-router";
 
 import { authenticate } from "../shopify.server";
 
-const HARDCODED_PASSWORD = "TEST-TAG-CLEANUP";
+const CLEANUP_PASSWORD = "TEST-TAG-CLEANUP";
 
 export const loader = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
@@ -26,7 +26,7 @@ export async function action({ request }) {
   ) {
     const submittedPassword = String(form.get("password") || "");
 
-    if (submittedPassword !== HARDCODED_PASSWORD) {
+    if (!CLEANUP_PASSWORD || submittedPassword !== CLEANUP_PASSWORD) {
       return {
         exportError: "Access denied: incorrect password.",
       };
@@ -58,8 +58,72 @@ export async function action({ request }) {
 
       const rows = [headers.map(csvCell).join(",")];
 
+      const apiUrl =
+        `https://${session.shop}/admin/api/2027-01/graphql.json`;
+
+      const graphqlRequest = async (requestQuery, variables = {}) => {
+        const response = await fetch(apiUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": session.accessToken,
+          },
+          body: JSON.stringify({
+            query: requestQuery,
+            variables,
+          }),
+        });
+
+        const payload = await response.json();
+        const messages = payload?.errors
+          ?.map((error) => error.message)
+          .join("; ");
+
+        if (!response.ok || payload?.errors?.length) {
+          throw new Error(
+            messages || `Shopify API request failed (${response.status}).`
+          );
+        }
+
+        return payload;
+      };
+
+      // Find the publication ID for the Online Store channel.
+      const publicationQuery = `#graphql
+        query OnlineStorePublication {
+          publications(first: 250) {
+            nodes {
+              id
+              channels(first: 10) {
+                nodes {
+                  handle
+                }
+              }
+            }
+          }
+        }
+      `;
+
+      const publicationPayload = await graphqlRequest(publicationQuery);
+
+      const onlineStorePublicationId =
+        publicationPayload?.data?.publications?.nodes?.find(
+          (publication) =>
+            publication?.channels?.nodes?.some(
+              (channel) => channel?.handle === "online_store"
+            )
+        )?.id;
+
+      if (!onlineStorePublicationId) {
+        throw new Error("Could not find the Online Store publication.");
+      }
+
       const query = `#graphql
-        query PhysicalProductVariants($first: Int!, $after: String) {
+        query PhysicalProductVariants(
+          $first: Int!
+          $after: String
+          $onlineStorePublicationId: ID!
+        ) {
           productVariants(first: $first, after: $after) {
             edges {
               cursor
@@ -69,6 +133,9 @@ export async function action({ request }) {
                 product {
                   title
                   status
+                  publishedOnOnlineStore: publishedOnPublication(
+                    publicationId: $onlineStorePublicationId
+                  )
                 }
                 inventoryItem {
                   requiresShipping
@@ -98,32 +165,11 @@ export async function action({ request }) {
       let cursor = null;
 
       do {
-        const response = await fetch(
-          `https://${session.shop}/admin/api/2027-01/graphql.json`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Shopify-Access-Token": session.accessToken,
-            },
-            body: JSON.stringify({
-              query,
-              variables: { first: 250, after: cursor },
-            }),
-          }
-        );
-
-        const payload = await response.json();
-
-        if (!response.ok || payload?.errors?.length) {
-          const messages = payload?.errors
-            ?.map((error) => error.message)
-            .join("; ");
-
-          throw new Error(
-            messages || `Shopify API request failed (${response.status}).`
-          );
-        }
+        const payload = await graphqlRequest(query, {
+          first: 250,
+          after: cursor,
+          onlineStorePublicationId,
+        });
 
         const connection = payload?.data?.productVariants;
 
@@ -137,10 +183,12 @@ export async function action({ request }) {
           const variant = edge?.node;
           const inventoryItem = variant?.inventoryItem;
 
-          // Include only variants of active products that require shipping.
+          // Include only active products published to the Online Store
+          // whose variants require shipping.
           if (
             !variant ||
             variant.product?.status !== "ACTIVE" ||
+            variant.product?.publishedOnOnlineStore !== true ||
             inventoryItem?.requiresShipping !== true
           ) {
             continue;
@@ -149,7 +197,7 @@ export async function action({ request }) {
           const weight = inventoryItem.measurement?.weight;
           const dimensions = inventoryItem.measurement?.packedDimensions;
 
-          // For this export, include variants with all missing or zero packed dimension.
+          // For this export, include variants with all missing or zero packed dimensions.
           if (
             isMissingDimensionsExport &&
             ![
@@ -216,7 +264,7 @@ export async function action({ request }) {
 
   const submittedPassword = String(form.get("password") || "");
 
-  if (submittedPassword !== HARDCODED_PASSWORD) {
+  if (!CLEANUP_PASSWORD || submittedPassword !== CLEANUP_PASSWORD) {
     return {
       summary: "Access denied: incorrect password.",
       customers: { checked: 0, updated: 0, edgesSeen: 0, sample: null },
